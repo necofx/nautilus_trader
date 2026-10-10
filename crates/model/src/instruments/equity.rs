@@ -17,7 +17,9 @@ use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
     Params, UnixNanos,
-    correctness::{CorrectnessResult, check_equal_u8, check_valid_string_ascii_optional},
+    correctness::{
+        CorrectnessError, CorrectnessResult, check_equal_u8, check_valid_string_ascii_optional,
+    },
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -59,6 +61,18 @@ pub struct Equity {
     pub price_precision: u8,
     /// The minimum price increment (tick size).
     pub price_increment: Price,
+    /// The trading size decimal precision (default 0: whole shares).
+    #[serde(
+        default = "default_size_precision",
+        skip_serializing_if = "is_default_size_precision"
+    )]
+    pub size_precision: u8,
+    /// The minimum size increment (default 1: whole shares).
+    #[serde(
+        default = "default_size_increment",
+        skip_serializing_if = "is_default_size_increment"
+    )]
+    pub size_increment: Quantity,
     /// The initial (order) margin requirement in percentage of order value.
     pub margin_init: Decimal,
     /// The maintenance (position) margin in percentage of position value.
@@ -81,6 +95,22 @@ pub struct Equity {
     pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the data object was initialized.
     pub ts_init: UnixNanos,
+}
+
+const fn default_size_precision() -> u8 {
+    0
+}
+
+fn default_size_increment() -> Quantity {
+    Quantity::from(1)
+}
+
+const fn is_default_size_precision(size_precision: &u8) -> bool {
+    *size_precision == 0
+}
+
+fn is_default_size_increment(size_increment: &Quantity) -> bool {
+    size_increment.precision == 0 && *size_increment == default_size_increment()
 }
 
 #[bon::bon]
@@ -126,6 +156,8 @@ impl Equity {
             currency,
             price_precision,
             price_increment,
+            size_precision: default_size_precision(),
+            size_increment: default_size_increment(),
             lot_size,
             max_quantity,
             min_quantity,
@@ -140,14 +172,59 @@ impl Equity {
         })
     }
 
+    /// Returns this equity with a fractional (or any non-default) trading size.
+    ///
+    /// By default an equity trades whole shares (`size_precision` 0, `size_increment` 1). Some
+    /// venues trade fractional shares, and split back-adjusted historical data carries
+    /// fractional volumes, which bars can only hold at a matching size precision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `size_increment.precision` differs from `size_precision`, if
+    /// `size_increment` is not positive, or if `lot_size`, `min_quantity` or `max_quantity` (when
+    /// set) has another precision than `size_precision`.
+    pub fn with_size(
+        mut self,
+        size_precision: u8,
+        size_increment: Quantity,
+    ) -> CorrectnessResult<Self> {
+        check_equal_u8(
+            size_precision,
+            size_increment.precision,
+            stringify!(size_precision),
+            stringify!(size_increment.precision),
+        )?;
+        check_positive_quantity(size_increment, stringify!(size_increment))?;
+        for (quantity, param) in [
+            (self.lot_size, "lot_size.precision"),
+            (self.min_quantity, "min_quantity.precision"),
+            (self.max_quantity, "max_quantity.precision"),
+        ] {
+            if let Some(quantity) = quantity {
+                check_equal_u8(
+                    quantity.precision,
+                    size_precision,
+                    param,
+                    stringify!(size_precision),
+                )?;
+            }
+        }
+        self.size_precision = size_precision;
+        self.size_increment = size_increment;
+        Ok(self)
+    }
+
     /// Returns a fluent builder for a [`Equity`] instance.
     ///
     /// Required fields are enforced at compile time; optional fields can be omitted and use the
     /// same defaults as checked construction. The same correctness checks run on `build`.
+    /// `size_precision` and `size_increment` are optional and go together (see
+    /// [`Equity::with_size`]); without them the equity trades whole shares.
     ///
     /// # Errors
     ///
-    /// Returns an error if any input validation fails.
+    /// Returns an error if any input validation fails, or if only one of `size_precision` and
+    /// `size_increment` is given.
     #[builder(start_fn = builder, finish_fn = build)]
     pub fn build_checked(
         instrument_id: InstrumentId,
@@ -156,6 +233,8 @@ impl Equity {
         currency: Currency,
         price_precision: u8,
         price_increment: Price,
+        size_precision: Option<u8>,
+        size_increment: Option<Quantity>,
         lot_size: Option<Quantity>,
         max_quantity: Option<Quantity>,
         min_quantity: Option<Quantity>,
@@ -168,7 +247,7 @@ impl Equity {
         ts_event: UnixNanos,
         ts_init: UnixNanos,
     ) -> CorrectnessResult<Self> {
-        Self::new_checked(
+        let equity = Self::new_checked(
             instrument_id,
             raw_symbol,
             isin,
@@ -186,7 +265,16 @@ impl Equity {
             info,
             ts_event,
             ts_init,
-        )
+        )?;
+        match (size_precision, size_increment) {
+            (None, None) => Ok(equity),
+            (Some(size_precision), Some(size_increment)) => {
+                equity.with_size(size_precision, size_increment)
+            }
+            _ => Err(CorrectnessError::PredicateViolation {
+                message: "`size_precision` and `size_increment` must be given together".to_string(),
+            }),
+        }
     }
 }
 
@@ -273,7 +361,7 @@ impl Instrument for Equity {
     }
 
     fn size_precision(&self) -> u8 {
-        0
+        self.size_precision
     }
 
     fn price_increment(&self) -> Price {
@@ -281,7 +369,7 @@ impl Instrument for Equity {
     }
 
     fn size_increment(&self) -> Quantity {
-        Quantity::from(1)
+        self.size_increment
     }
 
     fn multiplier(&self) -> Quantity {
@@ -535,5 +623,103 @@ mod tests {
             serde_json::to_value(&positional).unwrap(),
             serde_json::to_value(&built).unwrap(),
         );
+    }
+
+    fn fractional_builder() -> Equity {
+        Equity::builder()
+            .instrument_id(InstrumentId::from("AAPL.XNAS"))
+            .raw_symbol(Symbol::from("AAPL"))
+            .currency(Currency::USD())
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .size_precision(5)
+            .size_increment(Quantity::from("0.00001"))
+            .lot_size(Quantity::from("1.00000"))
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build()
+            .unwrap()
+    }
+
+    #[rstest]
+    fn test_default_sizes_are_whole_shares(equity_aapl: Equity) {
+        assert_eq!(equity_aapl.size_precision, 0);
+        assert_eq!(equity_aapl.size_increment, Quantity::from(1));
+        assert_eq!(equity_aapl.size_increment.precision, 0);
+    }
+
+    #[rstest]
+    fn test_with_size_sets_fractional_sizes(equity_aapl: Equity) {
+        let equity = equity_aapl.with_size(5, Quantity::from("0.00001")).unwrap();
+        assert_eq!(equity.size_precision(), 5);
+        assert_eq!(equity.size_increment(), Quantity::from("0.00001"));
+        assert_eq!(equity.size_increment().precision, 5);
+    }
+
+    #[rstest]
+    fn test_builder_with_fractional_sizes() {
+        let equity = fractional_builder();
+        assert_eq!(equity.size_precision(), 5);
+        assert_eq!(equity.size_increment(), Quantity::from("0.00001"));
+        assert_eq!(equity.lot_size(), Some(Quantity::from("1.00000")));
+        assert_eq!(equity.multiplier(), Quantity::from(1));
+    }
+
+    #[rstest]
+    fn test_with_size_rejects_precision_mismatch() {
+        let error = fractional_builder()
+            .with_size(4, Quantity::from("0.00001"))
+            .unwrap_err();
+        assert!(error.to_string().contains("size_precision"), "{error}");
+    }
+
+    #[rstest]
+    fn test_with_size_rejects_zero_increment() {
+        let error = fractional_builder()
+            .with_size(5, Quantity::from("0.00000"))
+            .unwrap_err();
+        assert!(error.to_string().contains("not positive"), "{error}");
+    }
+
+    #[rstest]
+    fn test_with_size_rejects_lot_size_at_another_precision() {
+        let error = fractional_builder()
+            .with_size(3, Quantity::from("0.001"))
+            .unwrap_err();
+        assert!(error.to_string().contains("lot_size.precision"), "{error}");
+    }
+
+    #[rstest]
+    fn test_builder_rejects_size_precision_without_increment() {
+        let result = Equity::builder()
+            .instrument_id(InstrumentId::from("AAPL.XNAS"))
+            .raw_symbol(Symbol::from("AAPL"))
+            .currency(Currency::USD())
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .size_precision(5)
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build();
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("together"), "{error}");
+    }
+
+    #[rstest]
+    fn test_serialization_omits_default_sizes(equity_aapl: Equity) {
+        let json = serde_json::to_string(&equity_aapl).unwrap();
+        assert!(!json.contains("size_precision"), "{json}");
+        assert!(!json.contains("size_increment"), "{json}");
+    }
+
+    #[rstest]
+    fn test_serialization_roundtrip_fractional_sizes() {
+        let equity = fractional_builder();
+        let json = serde_json::to_string(&equity).unwrap();
+        assert!(json.contains("\"size_precision\":5"), "{json}");
+        let deserialized: Equity = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.size_precision, 5);
+        assert_eq!(deserialized.size_increment, Quantity::from("0.00001"));
+        assert_eq!(deserialized.size_increment.precision, 5);
     }
 }

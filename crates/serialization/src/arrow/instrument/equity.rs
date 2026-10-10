@@ -60,6 +60,9 @@ impl ArrowSchemaProvider for Equity {
             json_string_field("info", true),
             Field::new("ts_event", timestamp_data_type(), false),
             Field::new("ts_init", timestamp_data_type(), false),
+            // Appended and nullable so batches written without them still decode (as 0 / "1").
+            Field::new("size_precision", DataType::UInt8, true),
+            Field::new("size_increment", DataType::Utf8, true),
         ];
 
         Schema::new_with_metadata(fields, metadata_with_type_name("Equity", metadata))
@@ -91,6 +94,8 @@ impl EncodeToRecordBatch for Equity {
         let mut info_builder = StringBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
+        let mut size_precision_builder = UInt8Array::builder(data.len());
+        let mut size_increment_builder = StringBuilder::new();
 
         for equity in data.iter().map(Borrow::borrow) {
             id_builder.append_value(equity.id.to_string());
@@ -161,6 +166,8 @@ impl EncodeToRecordBatch for Equity {
 
             ts_event_builder.append_value(equity.ts_event.as_u64());
             ts_init_builder.append_value(equity.ts_init.as_u64());
+            size_precision_builder.append_value(equity.size_precision);
+            size_increment_builder.append_value(equity.size_increment.to_string());
         }
 
         record_batch_with_timestamps(
@@ -183,6 +190,8 @@ impl EncodeToRecordBatch for Equity {
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
+                Arc::new(size_precision_builder.finish()),
+                Arc::new(size_increment_builder.finish()),
             ],
         )
     }
@@ -252,6 +261,18 @@ pub fn decode_equity_batch(
         extract_column_by_name::<UInt64Array>(record_batch, "ts_event", DataType::UInt64)?;
     let ts_init_values =
         extract_column_by_name::<UInt64Array>(record_batch, "ts_init", DataType::UInt64)?;
+    // Optional: absent in batches written before these columns existed.
+    let size_precision_values = match record_batch.schema().index_of("size_precision") {
+        Ok(index) => Some(extract_column::<UInt8Array>(
+            cols,
+            "size_precision",
+            index,
+            DataType::UInt8,
+        )?),
+        Err(_) => None,
+    };
+    let size_increment_values =
+        extract_optional_string_column_by_name(record_batch, "size_increment")?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -387,6 +408,17 @@ pub fn decode_equity_batch(
 
         let tick_scheme = optional_ustr_value(tick_scheme_values, i);
 
+        let size_precision =
+            size_precision_values.and_then(|values| (!values.is_null(i)).then(|| values.value(i)));
+        let size_increment = size_increment_values
+            .and_then(|values| (!values.is_null(i)).then(|| values.value(i)))
+            .map(|value| {
+                Quantity::from_str(value).map_err(|e| {
+                    EncodingError::ParseError("size_increment", format!("row {i}: {e}"))
+                })
+            })
+            .transpose()?;
+
         let equity = Equity::builder()
             .instrument_id(id)
             .raw_symbol(raw_symbol)
@@ -394,6 +426,8 @@ pub fn decode_equity_batch(
             .currency(currency)
             .price_precision(price_prec)
             .price_increment(price_increment)
+            .maybe_size_precision(size_precision)
+            .maybe_size_increment(size_increment)
             .maybe_lot_size(lot_size)
             .maybe_max_quantity(max_quantity)
             .maybe_min_quantity(min_quantity)
@@ -412,4 +446,95 @@ pub fn decode_equity_batch(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow::{datatypes::Schema, record_batch::RecordBatch};
+    use nautilus_model::{
+        identifiers::{InstrumentId, Symbol},
+        instruments::{Instrument, equity::Equity},
+        types::{currency::Currency, price::Price, quantity::Quantity},
+    };
+    use rstest::rstest;
+
+    use super::decode_equity_batch;
+    use crate::arrow::EncodeToRecordBatch;
+
+    fn equity(size: Option<(u8, &str)>) -> Equity {
+        let builder = Equity::builder()
+            .instrument_id(InstrumentId::from("AAC.XNYS"))
+            .raw_symbol(Symbol::from("AAC"))
+            .currency(Currency::USD())
+            .price_precision(4)
+            .price_increment(Price::from("0.0001"))
+            .ts_event(1.into())
+            .ts_init(2.into());
+        match size {
+            Some((precision, increment)) => builder
+                .size_precision(precision)
+                .size_increment(Quantity::from(increment))
+                .build(),
+            None => builder.build(),
+        }
+        .unwrap()
+    }
+
+    fn round_trip(equity: &Equity) -> Equity {
+        let metadata = HashMap::new();
+        let batch = Equity::encode_batch(&metadata, std::slice::from_ref(equity)).unwrap();
+        decode_equity_batch(&metadata, &batch).unwrap().remove(0)
+    }
+
+    #[rstest]
+    fn test_fractional_sizes_round_trip() {
+        let original = equity(Some((5, "0.00001")));
+        let decoded = round_trip(&original);
+        assert_eq!(decoded.size_precision(), 5);
+        assert_eq!(decoded.size_increment(), Quantity::from("0.00001"));
+        assert_eq!(decoded.size_increment().precision, 5);
+        assert_eq!(format!("{decoded:?}"), format!("{original:?}"));
+    }
+
+    #[rstest]
+    fn test_default_sizes_round_trip() {
+        let decoded = round_trip(&equity(None));
+        assert_eq!(decoded.size_precision(), 0);
+        assert_eq!(decoded.size_increment(), Quantity::from(1));
+    }
+
+    #[rstest]
+    fn test_batch_without_size_columns_decodes_with_defaults() {
+        let metadata = HashMap::new();
+        let batch = Equity::encode_batch(&metadata, &[equity(Some((5, "0.00001")))]).unwrap();
+        // Drop the two appended columns: the schema of batches written before they existed.
+        let keep = batch.num_columns() - 2;
+        let schema = Schema::new_with_metadata(
+            batch.schema().fields()[..keep].to_vec(),
+            batch.schema().metadata().clone(),
+        );
+        let old = RecordBatch::try_new(Arc::new(schema), batch.columns()[..keep].to_vec()).unwrap();
+        let decoded = decode_equity_batch(&metadata, &old).unwrap().remove(0);
+        assert_eq!(decoded.size_precision(), 0);
+        assert_eq!(decoded.size_increment(), Quantity::from(1));
+        assert_eq!(decoded.size_increment().precision, 0);
+    }
+
+    #[rstest]
+    fn test_batch_with_null_size_columns_decodes_with_defaults() {
+        use arrow::array::{StringArray, UInt8Array};
+
+        let metadata = HashMap::new();
+        let batch = Equity::encode_batch(&metadata, &[equity(Some((5, "0.00001")))]).unwrap();
+        let mut columns = batch.columns().to_vec();
+        let n = columns.len();
+        columns[n - 2] = Arc::new(UInt8Array::from(vec![None::<u8>]));
+        columns[n - 1] = Arc::new(StringArray::from(vec![None::<&str>]));
+        let nulls = RecordBatch::try_new(batch.schema(), columns).unwrap();
+        let decoded = decode_equity_batch(&metadata, &nulls).unwrap().remove(0);
+        assert_eq!(decoded.size_precision(), 0);
+        assert_eq!(decoded.size_increment(), Quantity::from(1));
+    }
 }
